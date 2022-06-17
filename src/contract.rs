@@ -1,11 +1,13 @@
 #[cfg(not(feature = "library"))]
+use std::collections::BTreeMap;
 use cosmwasm_std::entry_point;
-use cosmwasm_std::{to_binary, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult};
+use cosmwasm_std::{to_binary, Addr, Binary, Deps, DepsMut, Env, MessageInfo, QueryRequest, Response, StdResult, WasmQuery};
 use cw2::set_contract_version;
-
+use cw_asset::AssetInfo;
 use crate::error::ContractError;
-use crate::msg::{CountResponse, ExecuteMsg, InstantiateMsg, QueryMsg};
-use crate::state::{State, STATE};
+use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg, AssetQueryResponse, ContractQueryResponse};
+use crate::state::{ADMIN, CONTRACT_MAP, ASSET_MAP};
+use cosmwasm_storage::to_length_prefixed;
 
 // version info for migration info
 const CONTRACT_NAME: &str = "crates.io:cw-registry2";
@@ -16,20 +18,18 @@ pub fn instantiate(
     deps: DepsMut,
     _env: Env,
     info: MessageInfo,
-    msg: InstantiateMsg,
+    _msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    let state = State {
-        count: msg.count,
-        owner: info.sender.clone(),
-    };
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
-    STATE.save(deps.storage, &state)?;
+    // Setup the sender as the admin of the contract
+    ADMIN.set(deps, Some(info.sender.clone()))?;
 
     Ok(Response::new()
         .add_attribute("method", "instantiate")
-        .add_attribute("owner", info.sender)
-        .add_attribute("count", msg.count.to_string()))
+        .add_attribute("admin", info.sender))
 }
+
+// Routers
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn execute(
@@ -38,111 +38,136 @@ pub fn execute(
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
+    let api = deps.api;
     match msg {
-        ExecuteMsg::Increment {} => try_increment(deps),
-        ExecuteMsg::Reset { count } => try_reset(deps, info, count),
-    }
-}
-
-pub fn try_increment(deps: DepsMut) -> Result<Response, ContractError> {
-    STATE.update(deps.storage, |mut state| -> Result<_, ContractError> {
-        state.count += 1;
-        Ok(state)
-    })?;
-
-    Ok(Response::new().add_attribute("method", "try_increment"))
-}
-
-pub fn try_reset(deps: DepsMut, info: MessageInfo, count: i32) -> Result<Response, ContractError> {
-    STATE.update(deps.storage, |mut state| -> Result<_, ContractError> {
-        if info.sender != state.owner {
-            return Err(ContractError::Unauthorized {});
+        ExecuteMsg::SetAdmin { admin } => Ok(ADMIN.execute_update_admin(
+            deps,
+            info,
+            admin.map(|admin| api.addr_validate(&admin)).transpose()?,
+        )?),        
+        ExecuteMsg::UpdateContractAddresses { to_add, to_remove } => {
+            update_contract_addresses(deps, info, to_add, to_remove)
         }
-        state.count = count;
-        Ok(state)
-    })?;
-    Ok(Response::new().add_attribute("method", "reset"))
+        ExecuteMsg::UpdateAssetAddresses { to_add, to_remove } => {
+            update_asset_addresses(deps, info, to_add, to_remove)
+        }
+    }
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
+pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
-        QueryMsg::GetCount {} => to_binary(&query_count(deps)?),
+        QueryMsg::QueryAssets { names } => query_assets(deps, env, &names),
+        QueryMsg::QueryContracts { names } => query_contracts(deps, env, &names),
     }
 }
 
-fn query_count(deps: Deps) -> StdResult<CountResponse> {
-    let state = STATE.load(deps.storage)?;
-    Ok(CountResponse { count: state.count })
+// Query and Execute Handlers
+
+
+/// Adds, updates or removes provided addresses.
+pub fn update_contract_addresses(
+    deps: DepsMut,
+    msg_info: MessageInfo,
+    to_add: Vec<(String, String)>,
+    to_remove: Vec<String>,
+) -> Result<Response, ContractError> {
+    // Only Admin can call this method
+    ADMIN.assert_admin(deps.as_ref(), &msg_info.sender)?;
+    // Handle addresses to_add or update
+    for (name, new_address) in to_add.into_iter() {
+        let addr = deps.as_ref().api.addr_validate(&new_address)?;
+        // Update function for new or existing keys
+        let insert = |_| -> StdResult<Addr> { Ok(addr) };
+        CONTRACT_MAP.update(deps.storage, name.as_str(), insert)?;
+    }
+    // Handle addresses for deletion
+    for name in to_remove {
+        CONTRACT_MAP.remove(deps.storage, name.as_str());
+    }
+
+    Ok(Response::new().add_attribute("action", "updated contract addresses"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cosmwasm_std::testing::{mock_dependencies_with_balance, mock_env, mock_info};
-    use cosmwasm_std::{coins, from_binary};
-
-    #[test]
-    fn proper_initialization() {
-        let mut deps = mock_dependencies_with_balance(&coins(2, "token"));
-
-        let msg = InstantiateMsg { count: 17 };
-        let info = mock_info("creator", &coins(1000, "earth"));
-
-        // we can just call .unwrap() to assert this was a success
-        let res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
-        assert_eq!(0, res.messages.len());
-
-        // it worked, let's query the state
-        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetCount {}).unwrap();
-        let value: CountResponse = from_binary(&res).unwrap();
-        assert_eq!(17, value.count);
+/// Adds, updates or removes provided addresses.
+pub fn update_asset_addresses(
+    deps: DepsMut,
+    msg_info: MessageInfo,
+    to_add: Vec<(String, AssetInfo)>,
+    to_remove: Vec<String>,
+) -> Result<Response, ContractError> {
+    // Only Admin can call this method
+    ADMIN.assert_admin(deps.as_ref(), &msg_info.sender)?;
+    // Handle addresses to_add or update
+    for (name, new_address) in to_add.into_iter() {
+        // Update function for new or existing keys
+        let insert = |_| -> StdResult<AssetInfo> { Ok(new_address) };
+        ASSET_MAP.update(deps.storage, name.as_str(), insert)?;
+    }
+    // Handle addresses for deletion
+    for name in to_remove {
+        ASSET_MAP.remove(deps.storage, name.as_str());
     }
 
-    #[test]
-    fn increment() {
-        let mut deps = mock_dependencies_with_balance(&coins(2, "token"));
-
-        let msg = InstantiateMsg { count: 17 };
-        let info = mock_info("creator", &coins(2, "token"));
-        let _res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
-
-        // beneficiary can release it
-        let info = mock_info("anyone", &coins(2, "token"));
-        let msg = ExecuteMsg::Increment {};
-        let _res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
-
-        // should increase counter by 1
-        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetCount {}).unwrap();
-        let value: CountResponse = from_binary(&res).unwrap();
-        assert_eq!(18, value.count);
-    }
-
-    #[test]
-    fn reset() {
-        let mut deps = mock_dependencies_with_balance(&coins(2, "token"));
-
-        let msg = InstantiateMsg { count: 17 };
-        let info = mock_info("creator", &coins(2, "token"));
-        let _res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
-
-        // beneficiary can release it
-        let unauth_info = mock_info("anyone", &coins(2, "token"));
-        let msg = ExecuteMsg::Reset { count: 5 };
-        let res = execute(deps.as_mut(), mock_env(), unauth_info, msg);
-        match res {
-            Err(ContractError::Unauthorized {}) => {}
-            _ => panic!("Must return unauthorized error"),
-        }
-
-        // only the original creator can reset the counter
-        let auth_info = mock_info("creator", &coins(2, "token"));
-        let msg = ExecuteMsg::Reset { count: 5 };
-        let _res = execute(deps.as_mut(), mock_env(), auth_info, msg).unwrap();
-
-        // should now be 5
-        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetCount {}).unwrap();
-        let value: CountResponse = from_binary(&res).unwrap();
-        assert_eq!(5, value.count);
-    }
+    Ok(Response::new().add_attribute("action", "updated asset addresses"))
 }
+
+/// Query asset infos from the Registry asset_map.
+pub fn query_assets(
+    deps: Deps,
+    env: Env,
+    asset_names: &[String],
+) -> StdResult<Binary> {
+    let mut assets: BTreeMap<String, AssetInfo> = BTreeMap::new();
+
+    for asset in asset_names.iter() {
+        let result = deps
+            .querier
+            .query::<AssetInfo>(&QueryRequest::Wasm(WasmQuery::Raw {
+                contract_addr: env.contract.address.to_string(),
+                // query assets map
+                key: Binary::from(concat(&to_length_prefixed(b"assets"), asset.as_bytes())),
+            }))?;
+        assets.insert(asset.clone(), result);
+    }
+    let vector = assets.into_iter().map(|(v, k)| (v, k)).collect();
+    to_binary(&AssetQueryResponse { assets: vector })
+}
+
+/// Query contract addresses from the Registry contract_map.
+pub fn query_contracts(
+    deps: Deps,
+    env: Env,
+    contract_names: &[String],
+) -> StdResult<Binary> {
+    let mut contracts: BTreeMap<String, Addr> = BTreeMap::new();
+
+    // Query over
+    for contract in contract_names.iter() {
+        let result: Addr = deps
+            .querier
+            .query::<Addr>(&QueryRequest::Wasm(WasmQuery::Raw {
+                contract_addr: env.contract.address.to_string(),
+                key: Binary::from(concat(
+                    // Query contracts map
+                    &to_length_prefixed(b"contracts"),
+                    contract.as_bytes(),
+                )),
+            }))?;
+
+        contracts.insert(contract.clone(), result);
+    }
+    let vector = contracts
+    .into_iter()
+    .map(|(v, k)| (v, k.to_string()))
+    .collect();
+    to_binary(&ContractQueryResponse { contracts: vector })
+}
+
+#[inline]
+fn concat(namespace: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut k = namespace.to_vec();
+    k.extend_from_slice(key);
+    k
+}
+

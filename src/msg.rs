@@ -1,27 +1,45 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use cw_asset::AssetInfo;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-pub struct InstantiateMsg {
-    pub count: i32,
-}
+#[serde(rename_all = "snake_case")]
+pub struct InstantiateMsg {}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecuteMsg {
-    Increment {},
-    Reset { count: i32 },
+    /// Updates the addressbook
+    UpdateContractAddresses {
+        to_add: Vec<(String, String)>,
+        to_remove: Vec<String>,
+    },
+    UpdateAssetAddresses {
+        to_add: Vec<(String, AssetInfo)>,
+        to_remove: Vec<String>,
+    },
+    /// Sets a new Admin
+    SetAdmin { admin: Option<String> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryMsg {
-    // GetCount returns the current count as a json-encoded number
-    GetCount {},
+    /// Queries assets based on name
+    QueryAssets {
+        names: Vec<String>,
+    },
+    QueryContracts {
+        names: Vec<String>,
+    },
 }
 
-// We define a custom struct for each query response
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-pub struct CountResponse {
-    pub count: i32,
+pub struct AssetQueryResponse {
+    pub assets: Vec<(String, AssetInfo)>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct ContractQueryResponse {
+    pub contracts: Vec<(String, String)>,
 }
